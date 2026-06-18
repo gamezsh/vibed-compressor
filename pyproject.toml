@@ -1,0 +1,13 @@
+[project]
+name = "video-compressor"
+version = "0.1.0"
+description = "Drag-and-drop bulk video compressor"
+requires-python = ">=3.12"
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]
