@@ -16,6 +16,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Prevent CMD windows from flashing on Windows for every subprocess call
+_SUBPROCESS_FLAGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
 
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
@@ -41,7 +44,7 @@ def _check_ffmpeg() -> bool:
 def _get_duration(path: str) -> float:
     result = subprocess.run(
         [_get_ffmpeg_exe(), "-i", path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, **_SUBPROCESS_FLAGS,
     )
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", result.stderr)
     if not m:
@@ -71,7 +74,7 @@ def compress_video(input_path: str, output_path: str, target_mb: float,
         null_out = "/dev/null" if os.name != "nt" else "NUL"
 
         def run(args):
-            proc = subprocess.run(args, capture_output=True, text=True)
+            proc = subprocess.run(args, capture_output=True, text=True, **_SUBPROCESS_FLAGS)
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr[-800:])
 
