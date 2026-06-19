@@ -53,15 +53,36 @@ def _get_duration(path: str) -> float:
     return h * 3600 + mi * 60 + s
 
 
+def _fmt_time(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def _parse_time(text: str) -> float:
+    parts = text.strip().split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(parts[0])
+
+
 def compress_video(input_path: str, output_path: str, target_mb: float,
-                   on_progress=None) -> tuple[bool, str]:
+                   on_progress=None, trim_start: float | None = None,
+                   trim_end: float | None = None) -> tuple[bool, str]:
     """Compress video to at most target_mb. Returns (True, size_str) or (False, error_msg)."""
     tmpdir = None
     try:
         ffmpeg = _get_ffmpeg_exe()
-        duration = _get_duration(input_path)
-        if duration <= 0:
+        full_duration = _get_duration(input_path)
+        if full_duration <= 0:
             return False, "Could not read video duration."
+
+        t_start = trim_start or 0.0
+        t_end = trim_end if trim_end is not None else full_duration
+        duration = t_end - t_start
+        if duration <= 0:
+            return False, "Trim range produces zero duration."
 
         audio_kbps = 128
         target_bytes = int(target_mb * 1024 * 1024)
@@ -73,6 +94,10 @@ def compress_video(input_path: str, output_path: str, target_mb: float,
         log_prefix = os.path.join(tmpdir, "ffmpeg2pass")
         null_out = "/dev/null" if os.name != "nt" else "NUL"
 
+        # Input-seek args (timestamps reset to 0 after seek, so -t is relative)
+        seek_args = ["-ss", f"{t_start:.3f}"] if t_start > 0 else []
+        dur_args = ["-t", f"{duration:.3f}"] if (trim_start is not None or trim_end is not None) else []
+
         def run(args):
             proc = subprocess.run(args, capture_output=True, text=True, **_SUBPROCESS_FLAGS)
             if proc.returncode != 0:
@@ -82,7 +107,7 @@ def compress_video(input_path: str, output_path: str, target_mb: float,
             if on_progress:
                 on_progress(f"{label} 1/2…")
             run([
-                ffmpeg, "-y", "-i", input_path,
+                ffmpeg, "-y", *seek_args, "-i", input_path, *dur_args,
                 "-c:v", "libx264", "-b:v", f"{video_kbps:.0f}k",
                 "-pass", "1", "-passlogfile", log_prefix,
                 "-an", "-f", "null", null_out,
@@ -90,7 +115,7 @@ def compress_video(input_path: str, output_path: str, target_mb: float,
             if on_progress:
                 on_progress(f"{label} 2/2…")
             run([
-                ffmpeg, "-y", "-i", input_path,
+                ffmpeg, "-y", *seek_args, "-i", input_path, *dur_args,
                 "-c:v", "libx264", "-b:v", f"{video_kbps:.0f}k",
                 "-pass", "2", "-passlogfile", log_prefix,
                 "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -131,13 +156,309 @@ RED     = "#F38BA8"
 YELLOW  = "#F9E2AF"
 
 
+# ── trim dialog ───────────────────────────────────────────────────────────────
+
+class TrimDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, row):
+        super().__init__(parent)
+        self.row = row
+        self.title(f"Trim — {Path(row.path).name}")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+
+        self._tmpdir = tempfile.mkdtemp(prefix="vcmp_trim_")
+        self._duration = 0.0
+        self._q: queue.Queue = queue.Queue()
+        self._anim_frames: list = []
+        self._anim_index = 0
+        self._anim_job = None
+
+        self._start_var = tk.DoubleVar(value=0.0)
+        self._start_entry_var = tk.StringVar(value="00:00:00")
+        self._end_var = tk.DoubleVar(value=100.0)
+        self._end_entry_var = tk.StringVar(value="00:01:40")
+
+        self._build_ui()
+        self._center()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll()
+
+        threading.Thread(target=self._fetch_duration, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                fn, args, kwargs = self._q.get_nowait()
+                fn(*args, **kwargs)
+        except queue.Empty:
+            pass
+        self.after(30, self._poll)
+
+    def _ui(self, fn, *args, **kwargs):
+        self._q.put((fn, args, kwargs))
+
+    # ── duration loading ──────────────────────────────────────────────────────
+
+    def _fetch_duration(self):
+        try:
+            dur = _get_duration(self.row.path)
+        except Exception as e:
+            self._ui(self._dur_lbl.config, text=f"Error reading duration: {e}")
+            return
+        self._ui(self._on_duration_loaded, dur)
+
+    def _on_duration_loaded(self, dur: float):
+        self._duration = dur
+        self._dur_lbl.config(text=f"Duration: {_fmt_time(dur)}")
+
+        init_start = self.row.trim_start or 0.0
+        init_end = self.row.trim_end if self.row.trim_end is not None else dur
+
+        self._start_slider.config(to=dur)
+        self._end_slider.config(to=dur)
+
+        self._start_var.set(init_start)
+        self._end_var.set(init_end)
+        self._start_entry_var.set(_fmt_time(init_start))
+        self._end_entry_var.set(_fmt_time(init_end))
+        self._update_segment_label()
+
+        self._preview_at(init_start)
+
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        tk.Label(
+            self, text=Path(self.row.path).name, bg=BG, fg=TEXT,
+            font=("Segoe UI", 11, "bold"), wraplength=480, anchor="w",
+        ).pack(fill="x", padx=16, pady=(12, 2))
+
+        self._dur_lbl = tk.Label(self, text="Loading…", bg=BG, fg=MUTED,
+                                  font=("Segoe UI", 9), anchor="w")
+        self._dur_lbl.pack(fill="x", padx=16, pady=(0, 6))
+
+        # Preview area — fixed 480×270
+        preview_box = tk.Frame(self, bg=SURFACE, width=480, height=270)
+        preview_box.pack(padx=16, pady=(0, 8))
+        preview_box.pack_propagate(False)
+
+        self._preview_lbl = tk.Label(
+            preview_box, bg=SURFACE, fg=MUTED,
+            text="Preview will appear here\n(click a Preview button below)",
+            font=("Segoe UI", 10),
+        )
+        self._preview_lbl.pack(fill="both", expand=True)
+
+        # Start and end time rows
+        self._start_slider, self._end_slider = self._make_time_rows()
+
+        # Segment info
+        self._segment_lbl = tk.Label(self, text="", bg=BG, fg=YELLOW,
+                                      font=("Segoe UI", 9))
+        self._segment_lbl.pack(pady=(2, 0))
+
+        # Action buttons
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=(8, 12))
+
+        tk.Button(btn_row, text="Reset trim", bg=SURFACE, fg=MUTED,
+                  relief="flat", cursor="hand2", font=("Segoe UI", 10),
+                  command=self._reset).pack(side="left")
+
+        tk.Button(btn_row, text="Cancel", bg=SURFACE, fg=TEXT,
+                  relief="flat", cursor="hand2", font=("Segoe UI", 10),
+                  command=self._on_close).pack(side="right", padx=(6, 0))
+
+        tk.Button(btn_row, text="Apply trim", bg=ACCENT, fg="white",
+                  relief="flat", cursor="hand2",
+                  font=("Segoe UI", 10, "bold"), padx=14,
+                  command=self._apply).pack(side="right")
+
+    def _make_time_rows(self):
+        """Build start/end time rows; returns (start_slider, end_slider)."""
+        sliders = []
+        specs = [
+            ("Start:", self._start_var, self._start_entry_var, "start",
+             lambda: self._preview_at(self._start_var.get())),
+            ("End:",   self._end_var,   self._end_entry_var,   "end",
+             lambda: self._preview_at(self._end_var.get())),
+        ]
+        for label, dvar, evar, which, preview_fn in specs:
+            row = tk.Frame(self, bg=BG)
+            row.pack(fill="x", padx=16, pady=3)
+
+            tk.Label(row, text=label, bg=BG, fg=TEXT,
+                     font=("Segoe UI", 10), width=6, anchor="w").pack(side="left")
+
+            slider = tk.Scale(
+                row, variable=dvar, from_=0, to=100,
+                orient="horizontal", bg=BG, fg=TEXT, troughcolor=SURFACE,
+                activebackground=ACCENT, highlightthickness=0,
+                length=288, resolution=1, showvalue=False,
+                command=lambda v, w=which: self._on_slider(w, float(v)),
+            )
+            slider.pack(side="left", padx=(0, 6))
+            sliders.append(slider)
+
+            entry = tk.Entry(row, textvariable=evar, width=9,
+                             bg=SURFACE, fg=TEXT, insertbackground=TEXT,
+                             relief="flat", font=("Segoe UI", 10))
+            entry.pack(side="left", padx=(0, 6))
+            entry.bind("<Return>",   lambda _e, w=which: self._on_entry(w))
+            entry.bind("<FocusOut>", lambda _e, w=which: self._on_entry(w))
+
+            tk.Button(row, text="Preview", bg=ACCENT, fg="white",
+                      relief="flat", cursor="hand2", font=("Segoe UI", 9),
+                      command=preview_fn).pack(side="left")
+
+        return sliders[0], sliders[1]
+
+    # ── interaction ───────────────────────────────────────────────────────────
+
+    def _on_slider(self, which: str, val: float):
+        if which == "start":
+            self._start_entry_var.set(_fmt_time(val))
+        else:
+            self._end_entry_var.set(_fmt_time(val))
+        self._update_segment_label()
+
+    def _on_entry(self, which: str):
+        evar = self._start_entry_var if which == "start" else self._end_entry_var
+        dvar = self._start_var if which == "start" else self._end_var
+        try:
+            val = _parse_time(evar.get())
+        except ValueError:
+            return
+        val = max(0.0, min(val, self._duration))
+        dvar.set(val)
+        evar.set(_fmt_time(val))
+        self._update_segment_label()
+
+    def _update_segment_label(self):
+        start = self._start_var.get()
+        end = self._end_var.get()
+        if end > start:
+            self._segment_lbl.config(
+                text=f"{_fmt_time(start)} → {_fmt_time(end)}  (duration: {_fmt_time(end - start)})",
+                fg=YELLOW,
+            )
+        else:
+            self._segment_lbl.config(text="End must be after start", fg=RED)
+
+    # ── frame animation preview ───────────────────────────────────────────────
+
+    def _preview_at(self, t: float):
+        self._stop_anim()
+        frames_dir = os.path.join(self._tmpdir, "frames")
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        os.makedirs(frames_dir)
+        self._preview_lbl.config(text="Extracting frames…", image="")
+        threading.Thread(target=self._extract_frames, args=(t, frames_dir), daemon=True).start()
+
+    def _extract_frames(self, t: float, frames_dir: str):
+        out_pattern = os.path.join(frames_dir, "frame_%04d.png")
+        try:
+            subprocess.run(
+                [
+                    _get_ffmpeg_exe(), "-y",
+                    "-ss", f"{t:.3f}",
+                    "-i", self.row.path,
+                    "-t", "3",
+                    "-vf", "fps=10,scale=480:-2",
+                    out_pattern,
+                ],
+                capture_output=True, **_SUBPROCESS_FLAGS,
+            )
+        except Exception as e:
+            self._ui(self._preview_lbl.config, text=f"Error: {e}", image="")
+            return
+
+        frame_paths = sorted(Path(frames_dir).glob("frame_*.png"))
+        if not frame_paths:
+            self._ui(self._preview_lbl.config, text="Could not extract frames", image="")
+            return
+
+        self._ui(self._start_anim, frame_paths)
+
+    def _start_anim(self, frame_paths):
+        try:
+            self._anim_frames = [tk.PhotoImage(file=str(p)) for p in frame_paths]
+        except Exception as e:
+            self._preview_lbl.config(text=f"Could not load frames: {e}", image="")
+            return
+        self._anim_index = 0
+        self._tick_anim()
+
+    def _tick_anim(self):
+        if not self._anim_frames or not self.winfo_exists():
+            return
+        img = self._anim_frames[self._anim_index % len(self._anim_frames)]
+        self._preview_lbl.config(image=img, text="")
+        self._anim_index += 1
+        self._anim_job = self.after(100, self._tick_anim)
+
+    def _stop_anim(self):
+        if self._anim_job:
+            self.after_cancel(self._anim_job)
+            self._anim_job = None
+        self._anim_frames = []
+        self._anim_index = 0
+
+    # ── actions ───────────────────────────────────────────────────────────────
+
+    def _apply(self):
+        if self._duration <= 0:
+            messagebox.showwarning("Not ready", "Still loading video info, please wait.", parent=self)
+            return
+        start = self._start_var.get()
+        end = self._end_var.get()
+        if end <= start:
+            messagebox.showerror("Invalid trim", "End time must be after start time.", parent=self)
+            return
+
+        self.row.trim_start = start if start > 0 else None
+        self.row.trim_end = end if end < self._duration else None
+
+        if self.row.trim_start is not None or self.row.trim_end is not None:
+            s = _fmt_time(self.row.trim_start or 0.0)
+            e = _fmt_time(self.row.trim_end or self._duration)
+            self.row.set_trim_label(f"✂ {s}–{e}")
+        else:
+            self.row.set_trim_label("")
+
+        self._on_close()
+
+    def _reset(self):
+        self.row.trim_start = None
+        self.row.trim_end = None
+        self.row.set_trim_label("")
+        self._on_close()
+
+    def _center(self):
+        self.update_idletasks()
+        w, h = 540, 490
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _on_close(self):
+        self._stop_anim()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        self.destroy()
+
+
 # ── file row widget ───────────────────────────────────────────────────────────
 
 class FileRow:
-    def __init__(self, parent: tk.Frame, path: str, remove_cb):
+    def __init__(self, parent: tk.Frame, path: str, remove_cb, trim_cb):
         self.path = path
+        self.trim_start: float | None = None
+        self.trim_end: float | None = None
 
-        self.frame = tk.Frame(parent, bg=SURFACE, pady=4, padx=8, cursor="hand2")
+        self.frame = tk.Frame(parent, bg=SURFACE, pady=4, padx=8)
         self.frame.pack(fill="x", pady=2)
 
         self.lbl_name = tk.Label(
@@ -148,22 +469,46 @@ class FileRow:
 
         self.lbl_status = tk.Label(
             self.frame, text="queued", bg=SURFACE, fg=MUTED,
-            font=("Segoe UI", 9), width=18, anchor="e", cursor="hand2",
+            font=("Segoe UI", 9), width=18, anchor="e",
         )
         self.lbl_status.pack(side="right")
 
-        # Bind the whole row (frame + both labels) so clicking anywhere removes it
-        for widget in (self.frame, self.lbl_name, self.lbl_status):
-            widget.bind("<Button-1>", lambda _e, r=self: remove_cb(r))
-            widget.bind("<Enter>", lambda _e: self.frame.config(bg="#333352") or
-                        self.lbl_name.config(bg="#333352") or
-                        self.lbl_status.config(bg="#333352"))
-            widget.bind("<Leave>", lambda _e: self.frame.config(bg=SURFACE) or
-                        self.lbl_name.config(bg=SURFACE) or
-                        self.lbl_status.config(bg=SURFACE))
+        self.lbl_trim = tk.Label(
+            self.frame, text="", bg=SURFACE, fg=YELLOW,
+            font=("Segoe UI", 8),
+        )
+        self.lbl_trim.pack(side="right", padx=(0, 4))
+
+        self.btn_trim = tk.Button(
+            self.frame, text="✂", bg=SURFACE, fg=MUTED,
+            relief="flat", cursor="hand2", font=("Segoe UI", 12),
+            bd=0, padx=2, command=lambda: trim_cb(self),
+        )
+        self.btn_trim.pack(side="right", padx=(0, 2))
+
+        def _enter(_e):
+            for w in (self.frame, self.lbl_name, self.lbl_status, self.lbl_trim):
+                w.config(bg="#333352")
+            self.btn_trim.config(bg="#333352")
+
+        def _leave(_e):
+            for w in (self.frame, self.lbl_name, self.lbl_status, self.lbl_trim):
+                w.config(bg=SURFACE)
+            self.btn_trim.config(bg=SURFACE)
+
+        for widget in (self.frame, self.lbl_name, self.lbl_status, self.lbl_trim):
+            widget.bind("<Enter>", _enter)
+            widget.bind("<Leave>", _leave)
+
+        # Only lbl_name triggers removal; btn_trim has its own command
+        self.lbl_name.bind("<Button-1>", lambda _e, r=self: remove_cb(r))
 
     def set_status(self, text: str, color: str = MUTED):
         self.lbl_status.config(text=text, fg=color)
+
+    def set_trim_label(self, text: str):
+        self.lbl_trim.config(text=text)
+        self.btn_trim.config(fg=ACCENT if text else MUTED)
 
     def destroy(self):
         self.frame.destroy()
@@ -187,7 +532,6 @@ class App(tk.Tk):
         self._poll_ui_queue()
 
     def _poll_ui_queue(self):
-        """Drain the queue on the main thread — the safe way to update UI from threads."""
         try:
             while True:
                 fn, args, kwargs = self._ui_queue.get_nowait()
@@ -197,7 +541,6 @@ class App(tk.Tk):
         self.after(30, self._poll_ui_queue)
 
     def _ui(self, fn, *args, **kwargs):
-        """Schedule a UI update from any thread."""
         self._ui_queue.put((fn, args, kwargs))
 
     def _center(self):
@@ -242,7 +585,7 @@ class App(tk.Tk):
 
         list_header = tk.Frame(list_frame, bg=BG)
         list_header.pack(fill="x")
-        tk.Label(list_header, text="Files  (click a file to remove)",
+        tk.Label(list_header, text="Files  (click filename to remove · ✂ to trim)",
                  bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
         tk.Button(list_header, text="Clear all", bg=BG, fg=MUTED,
                   relief="flat", cursor="hand2", font=("Segoe UI", 9),
@@ -317,7 +660,7 @@ class App(tk.Tk):
         for p in paths:
             p = str(p).strip()
             if p and p not in existing and Path(p).suffix.lower() in video_exts:
-                self._rows.append(FileRow(self.inner, p, self._remove_row))
+                self._rows.append(FileRow(self.inner, p, self._remove_row, self._open_trim))
                 existing.add(p)
         self._update_drop_label()
 
@@ -349,6 +692,11 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
             self.outdir_var.set(d)
+
+    def _open_trim(self, row: FileRow):
+        if self._running:
+            return
+        TrimDialog(self, row)
 
     # ── compression ───────────────────────────────────────────────────────────
 
@@ -399,6 +747,8 @@ class App(tk.Tk):
                 ok, result = compress_video(
                     row.path, out_path, target_mb,
                     on_progress=lambda msg, r=row: self._ui(r.set_status, msg, YELLOW),
+                    trim_start=row.trim_start,
+                    trim_end=row.trim_end,
                 )
 
                 if ok:
